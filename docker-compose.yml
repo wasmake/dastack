@@ -1,0 +1,281 @@
+name: ${COMPOSE_PROJECT_NAME:-dastack-local}
+
+services:
+  mongo-keyfile-init:
+    image: alpine:3.22.1
+    restart: "no"
+    network_mode: none
+    environment:
+      MONGO_REPLICA_KEY: ${MONGO_REPLICA_KEY:-ChangeMeLocalReplicaKey32CharactersMinimum}
+    volumes:
+      - mongo_keyfile:/run/mongo-keyfile
+      - ./docker/mongo/init-keyfile.sh:/scripts/init-keyfile.sh:ro
+    command: ["/bin/sh", "/scripts/init-keyfile.sh"]
+
+  mongo:
+    image: mongo:8.0.12
+    restart: unless-stopped
+    depends_on:
+      mongo-keyfile-init:
+        condition: service_completed_successfully
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-dastack_root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-change-me-local-mongo-root}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-dastack}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-change-me-local-mongo-app}
+      MONGODB_DB: ${MONGODB_DB:-dastack}
+    command: ["mongod", "--config", "/etc/mongo/mongod.conf"]
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+      - mongo_keyfile:/run/mongo-keyfile:ro
+      - ./docker/mongo/mongod.conf:/etc/mongo/mongod.conf:ro
+      - ./docker/mongo/check-replica.sh:/scripts/check-replica.sh:ro
+    networks:
+      - data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'mongosh --quiet --host 127.0.0.1 --username "$${MONGO_INITDB_ROOT_USERNAME}" --password "$${MONGO_INITDB_ROOT_PASSWORD}" --authenticationDatabase admin --eval "quit(db.adminCommand(''ping'').ok ? 0 : 1)"',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+  mongo-rs-init:
+    image: mongo:8.0.12
+    restart: "no"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      MONGO_HOST: mongo
+      MONGO_REPLICA_HOST: mongo:27017
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-dastack_root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-change-me-local-mongo-root}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:-dastack}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:-change-me-local-mongo-app}
+      MONGODB_DB: ${MONGODB_DB:-dastack}
+    volumes:
+      - ./docker/mongo/init-replica.sh:/scripts/init-replica.sh:ro
+    networks:
+      - data
+    entrypoint: ["/bin/bash", "/scripts/init-replica.sh"]
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:7.4.5-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-change-me-local-redis}
+    command:
+      [
+        "/bin/sh",
+        "-c",
+        'exec redis-server --appendonly yes --requirepass "$${REDIS_PASSWORD}"',
+      ]
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'redis-cli --no-auth-warning -a "$${REDIS_PASSWORD}" ping | grep -q PONG',
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dastack-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-local-minio-password}
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - data
+      - monitoring
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null || exit 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dastack-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-me-local-minio-password}
+      MINIO_BUCKET: ${MINIO_BUCKET:-dastack}
+    volumes:
+      - ./docker/minio/init-bucket.sh:/scripts/init-bucket.sh:ro
+    networks:
+      - data
+    entrypoint: ["/bin/sh", "/scripts/init-bucket.sh"]
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2.10.0-alpine
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    ports:
+      - "127.0.0.1:${CADDY_HTTP_PORT:-8080}:8080"
+    volumes:
+      - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./docker/caddy/ingress.d:/etc/caddy/ingress.d:ro
+    tmpfs:
+      - /config:uid=1000,gid=1000,mode=0700
+      - /data:uid=1000,gid=1000,mode=0700
+    networks:
+      - ingress
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --quiet --output-document=/dev/null http://127.0.0.1:8080/healthz || exit 1",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  nginx:
+    image: nginx:1.28.0-alpine
+    restart: unless-stopped
+    user: nginx
+    read_only: true
+    cap_drop:
+      - ALL
+    ports:
+      - "127.0.0.1:${NGINX_HTTP_PORT:-8081}:8080"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./docker/nginx/ingress.d:/etc/nginx/ingress.d:ro
+    tmpfs:
+      - /tmp
+      - /var/cache/nginx
+      - /var/run
+    networks:
+      - ingress
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --quiet --output-document=/dev/null http://127.0.0.1:8080/healthz || exit 1",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    restart: unless-stopped
+    depends_on:
+      cadvisor:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.listen-address=0.0.0.0:9090
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    tmpfs:
+      - /tmp
+    networks:
+      - monitoring
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --quiet --output-document=/dev/null http://127.0.0.1:9090/-/healthy || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.5
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=10s
+    ports:
+      - "127.0.0.1:${CADVISOR_PORT:-8082}:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    networks:
+      - monitoring
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget --quiet --output-document=/dev/null http://127.0.0.1:8080/healthz || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+networks:
+  data: {}
+  ingress: {}
+  monitoring: {}
+
+volumes:
+  mongo_data:
+  mongo_keyfile:
+  redis_data:
+  minio_data:
+  prometheus_data:

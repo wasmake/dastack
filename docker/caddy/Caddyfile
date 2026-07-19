@@ -1,0 +1,16 @@
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	log {
+		output stdout
+		format console
+	}
+
+	respond /healthz "ok" 200
+	respond 404
+}
+
+import /etc/caddy/ingress.d/*.caddy
