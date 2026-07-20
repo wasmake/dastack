@@ -7,12 +7,23 @@ import { UserMenu } from "@/components/dashboard/user-menu";
 import { Button } from "@/components/ui/button";
 import { useShellStore } from "@/stores/shell-store";
 
-const labels: Record<string, string> = { "/dashboard": "Overview" };
+function pageLabel(pathname: string): string {
+  if (pathname === "/dashboard") return "Overview";
+  if (pathname.startsWith("/dashboard/projects/")) return "Project";
+  if (pathname === "/dashboard/projects") return "Projects";
+  if (pathname.startsWith("/dashboard/services/catalog/"))
+    return "Configure service";
+  if (pathname === "/dashboard/services/catalog") return "Service catalog";
+  if (pathname === "/dashboard/infrastructure/workers") return "Worker Nodes";
+  if (pathname === "/dashboard/resources") return "Resource limits";
+  if (pathname === "/dashboard/members") return "Members";
+  return "Dashboard";
+}
 
 export function Topbar({ onOpenCommand }: { onOpenCommand: () => void }) {
   const pathname = usePathname();
   const setMobileOpen = useShellStore((state) => state.setMobileSidebarOpen);
-  const label = labels[pathname] ?? "Dashboard";
+  const label = pageLabel(pathname);
 
   return (
     <header className="flex h-16 items-center gap-3 border-b bg-background/82 px-3 backdrop-blur-xl sm:px-5">

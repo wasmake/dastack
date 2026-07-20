@@ -1,0 +1,19 @@
+import { organizationIdSchema } from "@/features/organizations/schemas";
+import { getResourceEntitlement } from "@/features/resources/entitlements";
+import { handleApi } from "@/server/api";
+import { requireAuthenticatedUser } from "@/server/authorization";
+
+export const runtime = "nodejs";
+
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ organizationId: string }> },
+) {
+  return handleApi(request, async () => {
+    const user = await requireAuthenticatedUser();
+    const organizationId = organizationIdSchema.parse(
+      (await params).organizationId,
+    );
+    return { data: await getResourceEntitlement(organizationId, user.id) };
+  });
+}

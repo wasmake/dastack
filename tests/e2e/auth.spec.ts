@@ -8,7 +8,11 @@ test("registration, email verification, login, and organization creation", async
 }) => {
   const email = `playwright-${Date.now()}@example.test`;
   const password = "Playwright-Strong-42!";
-  const emailDirectory = path.resolve(".local/emails");
+  const configuredEmailDirectory = process.env.EMAIL_DEV_DIR;
+  if (!configuredEmailDirectory) {
+    throw new Error("EMAIL_DEV_DIR is required by the E2E auth test.");
+  }
+  const emailDirectory = path.resolve(configuredEmailDirectory);
   await mkdir(".artifacts/screens", { recursive: true });
   const before = new Set(await readdir(emailDirectory).catch(() => []));
 
@@ -59,7 +63,10 @@ test("registration, email verification, login, and organization creation", async
   await page.getByRole("link", { name: /Create organization/ }).click();
   await expect(page).toHaveURL(/\/onboarding/);
   await expect(page.getByText("Name your organization")).toBeVisible();
-  await page.screenshot({ path: ".artifacts/screens/onboarding-chromium.png", fullPage: true });
+  await page.screenshot({
+    path: ".artifacts/screens/onboarding-chromium.png",
+    fullPage: true,
+  });
   await page
     .getByLabel("Organization name")
     .fill(`Playwright Organization ${Date.now()}`);
@@ -67,8 +74,14 @@ test("registration, email verification, login, and organization creation", async
   await expect(page.getByText("Workspace found")).toBeVisible();
   await page.getByRole("link", { name: "Open dashboard" }).click();
   await expect(page.getByText("Organization overview")).toBeVisible();
-  await page.screenshot({ path: ".artifacts/screens/dashboard-chromium.png", fullPage: true });
+  await page.screenshot({
+    path: ".artifacts/screens/dashboard-chromium.png",
+    fullPage: true,
+  });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.locator("html")).toHaveJSProperty("scrollWidth", 390);
-  await page.screenshot({ path: ".artifacts/screens/dashboard-mobile-chromium.png", fullPage: true });
+  await page.screenshot({
+    path: ".artifacts/screens/dashboard-mobile-chromium.png",
+    fullPage: true,
+  });
 });

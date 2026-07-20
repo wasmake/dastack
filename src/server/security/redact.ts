@@ -16,8 +16,16 @@ function redactString(value: string): string {
 
 export function redactSecrets(value: unknown, depth = 0): unknown {
   if (depth > 4) return "[REDACTED]";
-  if (value instanceof Error)
-    return { name: value.name, message: redactString(value.message) };
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: redactString(value.message),
+      stack: value.stack
+        ?.split("\n")
+        .slice(1, 9)
+        .map((line) => redactString(line.trim())),
+    };
+  }
   if (Array.isArray(value))
     return value.slice(0, 20).map((item) => redactSecrets(item, depth + 1));
   if (typeof value === "string") return redactString(value);

@@ -1,6 +1,16 @@
 "use client";
 
-import { BookOpen, LayoutDashboard, Search, Waypoints } from "lucide-react";
+import {
+  BookOpen,
+  Boxes,
+  Gauge,
+  LayoutDashboard,
+  Library,
+  Search,
+  Server,
+  Users,
+  Waypoints,
+} from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import {
@@ -16,6 +26,36 @@ const actions = [
     href: "/dashboard",
     icon: LayoutDashboard,
     hint: "Dashboard",
+  },
+  {
+    label: "Open projects",
+    href: "/dashboard/projects",
+    icon: Boxes,
+    hint: "Workspace",
+  },
+  {
+    label: "Browse service catalog",
+    href: "/dashboard/services/catalog",
+    icon: Library,
+    hint: "Services",
+  },
+  {
+    label: "View worker nodes",
+    href: "/dashboard/infrastructure/workers",
+    icon: Server,
+    hint: "Infrastructure",
+  },
+  {
+    label: "View resource limits",
+    href: "/dashboard/resources",
+    icon: Gauge,
+    hint: "Governance",
+  },
+  {
+    label: "View members",
+    href: "/dashboard/members",
+    icon: Users,
+    hint: "Access",
   },
   {
     label: "Open organization setup",

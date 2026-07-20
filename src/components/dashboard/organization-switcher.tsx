@@ -1,7 +1,7 @@
 "use client";
 
 import { Building2, Check, ChevronsUpDown, Plus } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useOrganizations } from "@/hooks/use-organizations";
 import { useShellStore } from "@/stores/shell-store";
 import {
@@ -20,6 +20,7 @@ export function OrganizationSwitcher({
   collapsed?: boolean;
 }) {
   const router = useRouter();
+  const pathname = usePathname();
   const query = useOrganizations();
   const selectedId = useShellStore((state) => state.selectedOrganizationId);
   const setSelectedId = useShellStore(
@@ -70,7 +71,13 @@ export function OrganizationSwitcher({
         {organizations.map((organization) => (
           <DropdownItem
             key={organization.id}
-            onSelect={() => setSelectedId(organization.id)}
+            onSelect={() => {
+              const changed = organization.id !== selected?.id;
+              setSelectedId(organization.id);
+              if (changed && /^\/dashboard\/projects\/[^/]+/.test(pathname)) {
+                router.push("/dashboard/projects");
+              }
+            }}
           >
             <span className="grid size-6 place-items-center rounded bg-muted">
               <Building2 className="size-3.5" />

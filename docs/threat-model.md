@@ -2,9 +2,9 @@
 
 ## Scope and Assets
 
-Phase 1 includes a browser-facing Next.js control plane, identity and organization APIs, MongoDB persistence, transactional email, rate limiting, audit records, and a local dependency/monitoring stack. Current sensitive assets include password hashes, Auth.js secrets and cookies, OAuth credentials and provider tokens, one-time account and invitation tokens, application-session records, organization membership and role data, email contents, email provider credentials, audit metadata, database credentials, and the Docker daemon's host-level authority.
+Phase 2 includes a browser-facing Next.js control plane, identity and organization APIs, project/environment desired state, template drafts, entitlements and reservations, worker identity and health reporting, BullMQ reconciliation, MongoDB persistence, transactional email, rate limiting, audit records, and a local dependency/monitoring stack. Sensitive assets include password hashes, Auth.js secrets and cookies, OAuth credentials and provider tokens, one-time account/invitation/enrollment tokens, application sessions, tenant data, draft configuration, entitlement counters, worker private/public keys, command-signing keys when configured, replay records, email contents, provider credentials, audit metadata, database credentials, and the Docker daemon's host-level authority.
 
-Worker identities, job payloads, workload credentials, billing data, Vault-managed secrets, backup artifacts, and domain credentials belong to planned systems. Their presence in configuration placeholders or role permission names does not mean those systems exist.
+Worker identities and signed machine requests are implemented. Workload payloads and credentials, charged billing data, Vault-managed secrets, backup artifacts, and domain credentials belong to planned systems. Their presence in schemas, queue names, configuration, or role permissions does not mean those systems exist.
 
 Local defaults reduce accidental network exposure but do not make a developer workstation a production environment. Anyone with local Docker access is effectively a host administrator.
 
@@ -17,11 +17,14 @@ Implemented boundaries:
 - Control plane to MongoDB
 - Control plane to Redis for non-development rate limiting
 - Control plane to Resend in production or `EMAIL_DEV_DIR` in development
+- Worker agent to control-plane worker APIs
+- Control plane and the independent job runner to Redis/BullMQ
+- Job runner to MongoDB for reservation and worker reconciliation
 - Prometheus to monitored local targets
 - cAdvisor to the host kernel, Docker data directory, and Docker/containerd API sockets
 - Developer host to loopback-published Compose services
 
-The control-plane-to-worker boundary is planned and has no endpoint, identity, transport, queue, or execution implementation.
+The control-plane-to-worker identity and reporting boundary is implemented. Control-command delivery and workload execution boundaries are not.
 
 ## Implemented Application Controls
 
@@ -60,22 +63,18 @@ The control-plane-to-worker boundary is planned and has no endpoint, identity, t
 
 ## Worker Communication Threats
 
-The worker plane is not implemented. The following are requirements for a later design, not current guarantees.
+| Threat                                           | Phase 2 control and residual risk                                                                                                                                                                                                                     |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stolen enrollment token registers a rogue worker | Token digests are configured server-side and token consumption is one-use and transactional. Tokens have no intrinsic expiry or operator approval workflow, so secure out-of-band delivery and prompt digest replacement remain operational controls. |
+| Worker impersonation                             | Each worker has an expiring Ed25519 credential; rotation and revocation states are supported server-side. The current agent does not rotate automatically and there is no administrative revoke endpoint.                                             |
+| Control-plane impersonation                      | The agent requires HTTPS and normal certificate validation. Explicit insecure mode is limited to loopback and rejected in production. mTLS and certificate pinning are not implemented.                                                               |
+| Message tampering                                | A canonical domain/method/path/timestamp/nonce/body-digest envelope is signed and the raw body is schema-validated after signature verification.                                                                                                      |
+| Replay or delay                                  | Timestamp skew is bounded and nonces are consumed once in MongoDB with TTL. Result transitions are idempotent and bound to pre-existing worker commands.                                                                                              |
+| Cross-worker disclosure                          | No command delivery exists, so Phase 2 sends no workload payload. A later lease protocol must bind and encrypt payloads to the assigned worker.                                                                                                       |
+| Compromised worker pivots inward                 | The agent initiates outbound requests and has no inbound server or runtime socket. Production egress restrictions and separate host isolation remain deployment responsibilities.                                                                     |
+| Malicious job escape or secret exfiltration      | No workload executor or secret delivery exists. Sandbox, scoped credentials, output scanning, and egress policy are mandatory before implementing them.                                                                                               |
 
-| Threat                                           | Required control                                                                                                              |
-| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| Stolen enrollment token registers a rogue worker | Single-use, short-lived registration tokens; operator approval; bind identity after enrollment                                |
-| Worker impersonation                             | Unique per-worker key pair or mTLS certificate; rotation and immediate revocation                                             |
-| Control-plane impersonation                      | TLS verification with a pinned/private CA where appropriate; never disable certificate validation                             |
-| Message tampering                                | Sign the canonical envelope including worker, job, payload digest, timestamp, nonce, and protocol version                     |
-| Replay or delayed execution                      | Persist nonce/job state; enforce expiration and monotonic state transitions; make result submission idempotent                |
-| Cross-worker job disclosure                      | Authorize every lease to one worker identity; encrypt sensitive payloads to that worker; minimize payload contents            |
-| Compromised worker pivots inward                 | Worker-initiated outbound channel, allowlisted egress, no inbound control port, no control-plane network membership           |
-| Malicious job escapes execution                  | Non-root sandbox, resource limits, read-only base filesystem, bounded writable workspace, seccomp/AppArmor, no host mounts    |
-| Secret exfiltration                              | Deliver short-lived scoped credentials only when needed; redact logs; never place long-lived platform secrets in jobs         |
-| SSRF through callbacks/artifacts                 | Allowlist schemes and destinations, resolve and re-check DNS/IPs, reject link-local/private ranges unless explicitly required |
-
-The `WORKER_*` variables are placeholders only. No worker protocol, enrollment endpoint, queue consumer, provisioning action, or sandbox is implemented.
+The independent BullMQ runner currently consumes only stale-reservation and disconnected-worker jobs. It does not provision infrastructure or dispatch commands.
 
 ## Docker Socket
 
@@ -104,7 +103,7 @@ Required production response:
 
 ## Residual Risks
 
-- There is no production application image, ingress integration, TLS deployment, secret-manager integration, multi-node data topology, backup/restore process, or production operations runbook.
+- There is no production application/worker image, ingress integration, TLS deployment, secret-manager integration, multi-node data topology, backup/restore process, or production operations runbook.
 - OAuth account records can contain provider access, refresh, and ID tokens. Application-layer encryption and key rotation are not implemented; `DATA_ENCRYPTION_KEY` and `CREDENTIAL_ENCRYPTION_KEY` are reserved environment values only.
 - Authentication has no MFA, recovery codes, device confirmation, or administrator-driven account/session revocation API.
 - Exact origin checks reduce cross-origin mutation risk but do not protect against same-origin XSS, a compromised frontend dependency, stolen cookies, or malicious browser extensions.
@@ -112,9 +111,13 @@ Required production response:
 - Development rate limits reset on process restart and do not coordinate multiple application processes. Redis is required for coordinated non-development limits.
 - Public account endpoints intentionally suppress delivery errors to avoid exposing account state. Operators need protected delivery monitoring; no administrative delivery or audit-log API exists.
 - Audit records are not tamper-evident and have no implemented retention, export, or alerting pipeline.
+- Worker enrollment tokens have no built-in expiry, the agent lacks automatic credential rotation, and administrative worker disable/revoke APIs are absent.
+- The worker pool is global. Organization permission gates inventory reads, but all eligible nodes can serve any tenant; placement isolation policy is deferred.
+- Resource reservations write pending outbox events, but no relay publishes them. Usage and ledger models have no writers, and entitlement/template administration remains external.
+- The job runner is a separate required process. If it stops, stale reservations remain reserved and stale workers retain their last persisted status until selection-time freshness checks exclude them.
 - Local file emails contain usable verification, reset, magic-link, and invitation URLs. A user or process that can read the files can exercise those links before expiry.
 - Local credentials remain visible to users with Docker inspection access. Loopback services are reachable by other processes and users on the same host.
 - Dependency image tags are version-pinned but not digest-pinned. Production promotion should lock verified digests and generate an SBOM.
 - A single MongoDB member supports transaction semantics but not availability. Automated product backups and tested restores are not implemented.
 - Prometheus and MinIO's metrics endpoint have no application-layer authentication inside the isolated monitoring network.
-- MinIO is running local infrastructure but has no application authorization model or product data path. Workers, provisioning, Stripe, Vault, backups, and domains have not undergone implementation-level threat validation.
+- MinIO is running local infrastructure but has no application authorization model or product data path. Worker command execution, provisioning, Stripe, Vault, backups, and domains have not undergone implementation-level threat validation.

@@ -170,7 +170,12 @@ export async function listOrganizations(userId: string) {
       slug: organization.slug,
       status: organization.status,
       role: role
-        ? { id: toId(role._id), key: role.key, name: role.name }
+        ? {
+            id: toId(role._id),
+            key: role.key,
+            name: role.name,
+            permissions: role.permissions,
+          }
         : null,
       createdAt: organization.createdAt,
       version: organization.__v,

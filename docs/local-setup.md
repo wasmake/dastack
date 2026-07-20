@@ -6,6 +6,7 @@
 - Node.js 22 or later and pnpm 11.15.0
 - `curl` for host-side endpoint checks
 - Enough Docker resources for MongoDB, Redis, MinIO, both ingress servers, Prometheus, and cAdvisor
+- Playwright Chromium dependencies when running the end-to-end suite
 
 cAdvisor uses Linux host paths, `/dev/kmsg`, and exact Docker/containerd socket mounts. Docker Desktop and rootless Docker may require platform-specific changes. Do not broaden mounts or expose either runtime API over TCP to make it work. See the [threat model](threat-model.md).
 
@@ -28,7 +29,7 @@ The default development email transport needs no external account. GitHub and Go
 pnpm dev
 ```
 
-The bootstrap script validates Compose, starts MongoDB, idempotently initializes replica set `rs0` and its technical application user, starts the remaining services, creates the private MinIO bucket, and runs health checks. It does not start the Next.js application.
+The bootstrap script validates Compose, starts MongoDB, idempotently initializes replica set `rs0` and its technical application user, starts the remaining services, creates the private MinIO bucket, and runs health checks. It does not start Next.js, the worker agent, or the BullMQ runner.
 
 To start Compose without the wrapper:
 
@@ -42,19 +43,19 @@ Plain `docker compose up -d` includes one-shot Mongo and MinIO initialization se
 
 ## Endpoints
 
-| Service               | Local endpoint                           | Purpose                                                |
-| --------------------- | ---------------------------------------- | ------------------------------------------------------ |
-| Application           | `http://localhost:3000`                  | Host-run Phase 1 Next.js UI and API                    |
-| Application liveness  | `http://localhost:3000/api/health/live`  | Process liveness                                       |
-| Application readiness | `http://localhost:3000/api/health/ready` | Environment and application dependency readiness       |
-| MongoDB               | `127.0.0.1:27017`                        | Authenticated single-member `rs0`                      |
-| Redis                 | `127.0.0.1:6379`                         | Authenticated dependency; app limits use memory in dev |
-| MinIO API             | `http://127.0.0.1:9000`                  | S3-compatible local infrastructure; no app workflow    |
-| MinIO console         | `http://127.0.0.1:9001`                  | Local object storage console                           |
-| Caddy                 | `http://127.0.0.1:8080/healthz`          | Baseline ingress health only                           |
-| Nginx                 | `http://127.0.0.1:8081/healthz`          | Baseline ingress health only                           |
-| cAdvisor              | `http://127.0.0.1:8082`                  | Local container metrics UI                             |
-| Prometheus            | `http://127.0.0.1:9090`                  | Local metrics and targets                              |
+| Service               | Local endpoint                           | Purpose                                                  |
+| --------------------- | ---------------------------------------- | -------------------------------------------------------- |
+| Application           | `http://localhost:3000`                  | Host-run Phase 2 Next.js UI and API                      |
+| Application liveness  | `http://localhost:3000/api/health/live`  | Process liveness                                         |
+| Application readiness | `http://localhost:3000/api/health/ready` | Environment and application dependency readiness         |
+| MongoDB               | `127.0.0.1:27017`                        | Authenticated single-member `rs0`                        |
+| Redis                 | `127.0.0.1:6379`                         | Authenticated BullMQ store; app limits use memory in dev |
+| MinIO API             | `http://127.0.0.1:9000`                  | S3-compatible local infrastructure; no app workflow      |
+| MinIO console         | `http://127.0.0.1:9001`                  | Local object storage console                             |
+| Caddy                 | `http://127.0.0.1:8080/healthz`          | Baseline ingress health only                             |
+| Nginx                 | `http://127.0.0.1:8081/healthz`          | Baseline ingress health only                             |
+| cAdvisor              | `http://127.0.0.1:8082`                  | Local container metrics UI                               |
+| Prometheus            | `http://127.0.0.1:9090`                  | Local metrics and targets                                |
 
 All published infrastructure ports explicitly bind to loopback. Caddy and Nginx return `404` outside their health endpoints and do not proxy the host-run application.
 
@@ -69,7 +70,59 @@ pnpm test:e2e
 pnpm build
 ```
 
-`pnpm test:integration` requires the local MongoDB replica set. `pnpm test:e2e` starts or reuses the development server and runs desktop Chromium plus the configured mobile visual checks; install Playwright browser dependencies if they are not present.
+`pnpm test:integration` requires the local MongoDB replica set. `pnpm test:e2e` requires a free `E2E_PORT` (default `3000`), creates a scoped user for a guarded `dastack_e2e_*` disposable database, enrolls a real temporary worker, runs desktop Chromium plus the configured mobile checks, and removes the database and per-run artifacts after the browser server exits. The app receives only the scoped URI. Local lifecycle access comes from `MONGO_ROOT_USERNAME`, `MONGO_ROOT_PASSWORD`, and `MONGO_PORT`; CI or another external Mongo deployment must provide a dedicated privileged `E2E_MONGODB_URI` to the outer wrapper.
+
+## Worker Enrollment and Heartbeats
+
+Create an ordinary account and organization first. Use that operator user ID and organization ID as the local technical audit principal. Generate a fresh enrollment credential:
+
+```bash
+pnpm worker:token
+```
+
+The command prints a plaintext `token` and its SHA-256 `digest`. Treat the token as a secret. Put the digest and existing 24-character IDs in `.env`, enable loopback HTTP only for local development, and restart Next.js:
+
+```dotenv
+WORKER_ALLOW_INSECURE_HTTP=true
+WORKER_ENROLLMENT_TOKEN_DIGEST=<digest>
+WORKER_SYSTEM_ACTOR_ID=<operator-user-object-id>
+WORKER_SYSTEM_ORGANIZATION_ID=<operator-organization-object-id>
+```
+
+Deliver the plaintext token only to the enrolling agent. The following command creates a mode-`0600` Ed25519 state file and exchanges the one-use token for a worker credential:
+
+```bash
+WORKER_ENROLLMENT_TOKEN='<token>' pnpm worker:agent enroll \
+  --url http://localhost:3000 \
+  --name local-worker \
+  --region local-1 \
+  --provider local \
+  --capability phase-2-heartbeat \
+  --concurrency 2 \
+  --state .local/worker-agent.json \
+  --allow-http
+```
+
+Keep heartbeats running in a separate process:
+
+```bash
+pnpm worker:agent start \
+  --state .local/worker-agent.json \
+  --interval 30 \
+  --allow-http
+```
+
+`--allow-http` accepts only loopback HTTP. Omit it and use an HTTPS control-plane URL outside local development. A token digest can enroll one key only; generate and configure a new token for each additional worker. The state file contains the private key and must remain secret. The current agent reports host capacity and health but does not accept or execute commands.
+
+## Reconciliation Runner
+
+Start the independent BullMQ process whenever reservations or workers are in use:
+
+```bash
+pnpm jobs:dev
+```
+
+The runner schedules only two implemented jobs: releasing expired unconfirmed reservations and marking stale workers offline. It is not started by `pnpm dev` or Compose. Set a unique `JOB_QUEUE_PREFIX` for every deployment sharing Redis; local development falls back to `COMPOSE_PROJECT_NAME`. Set `JOB_RUNNER_HEALTH_PORT` to expose loopback-only `/live` and `/ready` endpoints for the runner.
 
 ## Infrastructure Operations
 

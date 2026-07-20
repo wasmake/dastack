@@ -1,6 +1,6 @@
-# Phase 1 API
+# Phase 2 API
 
-The Next.js application implements health, identity, session, and organization APIs under `/api`. Workers, provisioning, services, billing, secrets, backups, domains, and product object-storage APIs are not implemented.
+The Next.js application implements health, identity, organization, project, environment, template, draft, entitlement, reservation, and worker APIs under `/api`. Provisioning, deployed services, billing mutations, secrets, backups, domains, and product object-storage APIs are not implemented.
 
 ## Conventions
 
@@ -32,14 +32,14 @@ Auth.js endpoints use Auth.js request and response formats rather than the appli
 
 ## Authentication and Origin Checks
 
-Authenticated endpoints use the Auth.js session cookie and also validate the persisted `AppSession` against its user, token version, revocation state, and expiry. No bearer-token API is implemented.
+Browser-authenticated endpoints use the Auth.js session cookie and also validate the persisted `AppSession` against its user, token version, revocation state, and expiry. Worker enrollment uses a one-use bearer token; all later worker mutations use signed machine requests rather than a browser session.
 
-Every custom `POST`, `PATCH`, and `DELETE` endpoint below requires:
+Every browser-facing custom `POST`, `PATCH`, and `DELETE` endpoint below requires:
 
 - An `Origin` header exactly equal to the origin of `APP_URL`
 - If `Sec-Fetch-Site` is present, a value of `same-origin`, `same-site`, or `none`
 
-A missing or mismatched origin returns `403 INVALID_ORIGIN`. This requirement applies to public account mutations as well as authenticated mutations. The email-verification `GET` is the only custom state-changing route and is token-authorized rather than origin-authorized.
+A missing or mismatched origin returns `403 INVALID_ORIGIN`. This requirement applies to public account mutations as well as authenticated mutations. The email-verification `GET` is token-authorized. Worker machine routes do not use browser origin checks; they require HTTPS and their token or signature protocol instead.
 
 The Auth.js catch-all route separately requires the request URL origin to equal the `APP_URL` origin. Password and magic-link sign-in also apply the custom mutation-origin check. GitHub and Google callbacks follow the OAuth redirect protocol and require a verified provider email in the sign-in callback.
 
@@ -112,7 +112,66 @@ Organization creation atomically creates the organization, the five built-in rol
 
 Role assignment rejects permission escalation: an actor cannot grant permissions they do not hold. Optimistic membership updates require the current `version`. Last-owner checks prevent demotion, removal, or leaving until another owner exists; explicit ownership transfer promotes the target and changes the transferring owner to admin.
 
-Role definitions contain reserved permissions for later product areas. There are no Phase 1 APIs for projects, services, workers, billing, backups, domains, ingress management, public IPs, or secrets.
+Role definitions contain reserved permissions for later product areas. Their presence does not imply that provisioning, billing mutations, backups, domains, ingress management, public IPs, or secrets are implemented.
+
+## Projects and Environments
+
+All routes below require an authenticated active organization member. IDs are MongoDB ObjectId strings. Updates require the current optimistic `version`; stale writes return `409 VERSION_CONFLICT`.
+
+| Method                   | Endpoint                                                                                | Permission                           | Input or result                                                              |
+| ------------------------ | --------------------------------------------------------------------------------------- | ------------------------------------ | ---------------------------------------------------------------------------- |
+| `GET`, `POST`            | `/api/organizations/{organizationId}/projects`                                          | `project:view`, `project:create`     | List projects or create from `{ name, slug?, description?, icon? }`          |
+| `GET`, `PATCH`, `DELETE` | `/api/organizations/{organizationId}/projects/{projectId}`                              | `project:view`, `project:create`     | Read, update with `version`, or soft-delete a project                        |
+| `GET`, `POST`            | `/api/organizations/{organizationId}/projects/{projectId}/environments`                 | `project:view`, `environment:manage` | List environments or create from `{ name, slug?, type, isDefault?, region }` |
+| `GET`, `PATCH`, `DELETE` | `/api/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}` | `project:view`, `environment:manage` | Read, update with `version`, or soft-delete an environment                   |
+
+Project icons are `box`, `boxes`, `database`, `globe`, or `layers`. Environment types are `production`, `preview`, `development`, or `custom`. Creation and region changes require a schedulable worker in that region with a heartbeat no older than two minutes. The generated `networkId` is persisted desired state; no Docker network is created. Projects with active environments and environments with active reservations cannot be deleted.
+
+## Templates and Service Drafts
+
+| Method                   | Endpoint                                                                                                 | Auth             | Result                                                     |
+| ------------------------ | -------------------------------------------------------------------------------------------------------- | ---------------- | ---------------------------------------------------------- |
+| `GET`                    | `/api/templates`                                                                                         | Public           | Latest published global version of each template           |
+| `GET`                    | `/api/templates/{templateId}`                                                                            | Public           | Latest published version of one template                   |
+| `GET`                    | `/api/templates/{templateId}/versions/{manifestVersion}`                                                 | Public           | Exact published version                                    |
+| `GET`, `POST`            | `/api/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/drafts`           | `service:create` | List the caller's active drafts or validate and create one |
+| `GET`, `PATCH`, `DELETE` | `/api/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/drafts/{draftId}` | `service:create` | Read, update with `version`, or abandon the caller's draft |
+
+A draft input is `{ name, templateId, manifestVersion, values }`. Wizard values are validated against the manifest JSON Schema and mapped to provider-neutral desired configuration. Secret fields accept only `vault://...` references; Phase 2 does not resolve them. Abandoned drafts receive a 30-day TTL. There is no manifest import/publication HTTP endpoint, draft submission endpoint, deployed-service record, or deploy action. Operators must call the internal manifest service from trusted administration code until an administration API exists.
+
+## Entitlements and Reservations
+
+| Method | Endpoint                                                                   | Permission          | Input or result                                                             |
+| ------ | -------------------------------------------------------------------------- | ------------------- | --------------------------------------------------------------------------- |
+| `GET`  | `/api/organizations/{organizationId}/entitlements`                         | `billing:read`      | Entitlement status, validity, limits, and reserved/allocated counters       |
+| `POST` | `/api/organizations/{organizationId}/reservations`                         | `service:create`    | Atomically reserve organization and worker capacity                         |
+| `GET`  | `/api/organizations/{organizationId}/reservations/{reservationId}`         | `project:view`      | Read one tenant-scoped reservation                                          |
+| `POST` | `/api/organizations/{organizationId}/reservations/{reservationId}/confirm` | `service:lifecycle` | Idempotently move reserved counters to allocated counters                   |
+| `POST` | `/api/organizations/{organizationId}/reservations/{reservationId}/release` | `service:lifecycle` | Idempotently release counters; optional `reason` is `requested` or `failed` |
+
+Reservation creation requires an `Idempotency-Key` header and a strict body containing `projectId`, `environmentId`, optional `workerNodeId`, and resource quantities for CPU millicores, memory MiB, storage GiB, transfer GiB, backups, and concurrent operations. CPU, memory, and concurrency must be positive; the other quantities may be zero. It requires a currently valid active/trialing entitlement and eligible worker capacity, reserves one service for 15 minutes, and writes an audit and pending outbox event in the transaction. Transfer and backup quotas are organization-only. The independent job runner releases stale unconfirmed reservations.
+
+There is no entitlement administration API, reservation list API, outbox publisher, usage writer, or billing collector. Project and environment count limits are checked during reservation, not during project or environment creation.
+
+## Worker Protocol
+
+`GET /api/workers?organizationId=...` uses a browser session and `environment:manage`; it returns all non-disabled nodes in the global worker pool. Worker machine routes are:
+
+| Method | Endpoint                                      | Authentication                                         | Status |
+| ------ | --------------------------------------------- | ------------------------------------------------------ | ------ |
+| `POST` | `/api/workers/enroll`                         | Bearer token matching `WORKER_ENROLLMENT_TOKEN_DIGEST` | `201`  |
+| `POST` | `/api/workers/heartbeat`                      | Active Ed25519 worker credential                       | `202`  |
+| `POST` | `/api/workers/results`                        | Active Ed25519 worker credential                       | `202`  |
+| `POST` | `/api/workers/credentials/rotation-challenge` | Active Ed25519 worker credential                       | `201`  |
+| `POST` | `/api/workers/credentials/rotate`             | Old credential plus replacement-key proof              | `201`  |
+
+Signed requests send `x-dastack-worker-key-id`, `x-dastack-worker-timestamp`, `x-dastack-worker-nonce`, and `x-dastack-worker-signature`. The signature covers a versioned domain, method, pathname, timestamp, nonce, and raw-body SHA-256 digest. Credentials must be active and unexpired, timestamps must be within the configured skew, and each nonce is consumed once in MongoDB. Worker bodies are limited to 32 KiB. HTTPS is required except explicit non-production loopback HTTP.
+
+Heartbeats report `ready`, `degraded`, or `draining`, authoritative host capacity, reported allocation, host usage, and runtime metadata. Only `ready` nodes are schedulable. Results are accepted only for a pre-existing command record assigned to that worker; Phase 2 does not create or deliver such commands, and the included agent sends only enrollment and heartbeats.
+
+## Job Runner
+
+`pnpm jobs:dev` is a separate BullMQ process. It registers the queue vocabulary but runs only `reconcile-stale-reservations` and `detect-disconnected-workers`. Repeat schedulers enqueue those jobs at the configured intervals. No HTTP API starts the runner, and the remaining queue names have no consumers.
 
 ## Local Infrastructure Endpoints
 

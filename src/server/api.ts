@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { errorPayload } from "@/server/security/errors";
-import { AppError } from "@/server/security/errors";
+import { AppError, errorPayload } from "@/server/security/errors";
 import { secureLogError } from "@/server/security/redact";
 import {
   getRequestContext,
@@ -9,18 +8,59 @@ import {
 } from "@/server/security/request";
 
 type ApiResult = { data: unknown; status?: number; headers?: HeadersInit };
+const MAX_JSON_BODY_BYTES = 64 * 1_024;
 
-export async function readJson(request: Request): Promise<unknown> {
-  const contentLength = Number(request.headers.get("content-length") ?? "0");
-  if (contentLength > 64 * 1_024)
+export async function readBody(
+  request: Request,
+  maximumBytes: number,
+): Promise<Uint8Array> {
+  const rawLength = request.headers.get("content-length");
+  const declaredLength = rawLength === null ? 0 : Number(rawLength);
+  if (
+    !Number.isSafeInteger(declaredLength) ||
+    declaredLength < 0 ||
+    declaredLength > maximumBytes
+  ) {
     throw new AppError(
       413,
       "PAYLOAD_TOO_LARGE",
       "The request body is too large.",
     );
+  }
+  if (!request.body) return new Uint8Array();
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maximumBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw new AppError(
+        413,
+        "PAYLOAD_TOO_LARGE",
+        "The request body is too large.",
+      );
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+export async function readJson(request: Request): Promise<unknown> {
   try {
-    return await request.json();
-  } catch {
+    const body = await readBody(request, MAX_JSON_BODY_BYTES);
+    return JSON.parse(new TextDecoder().decode(body));
+  } catch (error) {
+    if (error instanceof AppError) throw error;
     throw new AppError(
       400,
       "INVALID_JSON",

@@ -6,6 +6,12 @@ export type Organization = {
   id: string;
   name: string;
   slug?: string;
+  role?: {
+    id: string;
+    key: string;
+    name: string;
+    permissions: string[];
+  } | null;
 };
 
 type OrganizationsPayload =

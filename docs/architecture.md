@@ -1,18 +1,18 @@
 # Architecture
 
-## Phase 1 Scope
+## Phase 2 Scope
 
-The current control plane is a host-run Next.js App Router application with React server and client components. It implements marketing and status pages, account and sign-in flows, invitation acceptance, organization onboarding, and an authenticated dashboard shell.
+The current control plane is a host-run Next.js App Router application with React server and client components. In addition to identity and organization flows, it implements persisted projects and environments, service-template catalog reads and drafts, entitlement reads, atomic resource reservations, a global worker inventory, and operational dashboard views.
 
-The server uses Auth.js for credentials, magic-link, GitHub, and Google authentication. MongoDB stores identity, revocable application sessions, one-time token digests, organizations, built-in roles, memberships, invitations, audit records, and email delivery records. Organization writes that span records use transactions. Redis backs rate limiting outside development; development intentionally uses a process-local memory limiter. Transactional email uses Resend in production or mode-`0600` files under `EMAIL_DEV_DIR` in development.
+The server uses Auth.js for credentials, magic-link, GitHub, and Google authentication. MongoDB stores identity, revocable application sessions, organizations, projects, environments, manifests, drafts, entitlements, reservations, workers, credentials, replay records, outbox events, audits, and email deliveries. Multi-record resource and organization writes use transactions. Redis backs distributed rate limiting outside development and BullMQ in every environment. Transactional email uses Resend in production or mode-`0600` files under `EMAIL_DEV_DIR` in development.
 
 The Docker Compose stack supplies an authenticated single-member MongoDB replica set, authenticated Redis, MinIO, two independent ingress baselines, Prometheus, and cAdvisor. The application runs on the host and reaches local data services through loopback-published ports. Caddy and Nginx expose only `/healthz` and do not proxy the application.
 
-MinIO is operational local infrastructure but no application object-storage workflow uses it. Workers, workload provisioning, Stripe billing, Vault integration, product backups, and domain management remain planned.
+MinIO is operational local infrastructure but no application object-storage workflow uses it. A separate worker agent enrolls and sends signed heartbeats, while a separate BullMQ runner reconciles stale reservations and workers. Workload provisioning, command delivery and execution, Stripe billing, Vault resolution, product backups, and domain management remain planned.
 
 ## Control Plane
 
-Solid arrows are implemented code paths. Dashed arrows are planned boundaries without a Phase 1 product implementation.
+Solid arrows are implemented code paths. Dashed arrows are deferred boundaries without a Phase 2 product implementation.
 
 ```mermaid
 flowchart LR
@@ -23,9 +23,12 @@ flowchart LR
     Web -->|rate limits outside development| Redis[(Redis)]
     Web -->|production transactional email| Resend[Resend]
     Web -->|development transactional email| Files[(EMAIL_DEV_DIR)]
+    Agent[Worker agent] -->|enroll and signed heartbeats| Web
+    Runner[BullMQ runner] -->|reconciliation jobs| Redis
+    Runner -->|reservation and worker state| Mongo
     Web -.->|application objects, planned| S3[(MinIO / S3)]
     Web -.->|billing, planned| Stripe[Stripe]
-    Worker[Worker, planned] -.->|worker protocol, planned| Web
+    Runtime[Workload runtime, planned] -.->|command execution, planned| Agent
 ```
 
 Password and magic-link authentication are also implemented inside the browser-to-control-plane path. GitHub and Google code paths are present but are enabled in the UI only when each provider's credentials are configured.
@@ -40,26 +43,27 @@ Organizations create five built-in roles and an owner membership in one transact
 
 ## Worker Plane
 
-The entire worker plane is a design target, not running Phase 1 code.
+Phase 2 implements worker identity and health reporting, not workload execution. Enrollment exchanges a one-use bearer token for a unique Ed25519 credential. Subsequent heartbeat, result, and credential-rotation requests sign a canonical method/path/timestamp/nonce/body envelope; nonce consumption and credential state are persisted in MongoDB. HTTPS is mandatory except explicit loopback development mode.
 
 ```mermaid
 flowchart LR
-    subgraph WorkerHost[Separate worker trust boundary, planned]
+    subgraph WorkerHost[Separate worker trust boundary]
         Agent[Worker agent]
-        Verify[Signature and replay verifier]
-        Sandbox[Restricted execution adapter]
-        Agent -.-> Verify
-        Verify -.-> Sandbox
+        State[(Mode-0600 Ed25519 state)]
+        Runtime[Execution adapter, planned]
+        Agent --> State
+        Agent -.-> Runtime
     end
 
-    Control[Control-plane worker API, planned] -.->|signed job envelope over TLS or mTLS| Agent
-    Agent -.->|signed heartbeat, result, and audit metadata| Control
-    Sandbox -.->|allowlisted egress only| Allowed[Approved external targets]
-    Secrets[Short-lived worker credentials, planned] -.-> Agent
-    DockerSock[Docker socket] -.->|explicitly forbidden| Agent
+    Control[Control-plane worker API]
+    Agent -->|enrollment and signed reports over TLS| Control
+    Control -->|credential and replay state| Mongo[(MongoDB)]
+    Control -.->|command delivery, planned| Agent
+    Runtime -.->|allowlisted egress, planned| Allowed[Approved targets]
+    DockerSock[Docker socket] -.->|not mounted or used| Agent
 ```
 
-Workers should initiate outbound connections, use per-worker identities, reject replayed messages, and receive scoped short-lived secrets. A worker must not receive the control-plane host's Docker socket. See [worker security](worker-security.md).
+Workers initiate outbound requests and use per-worker identities. The included agent reports real host capacity and health but has no command receiver, result sender, secret delivery, sandbox, or container-runtime integration. A result endpoint and control-command signing primitive exist for the later delivery path; neither provisions a workload. See [worker security](worker-security.md).
 
 ## Local Components
 
@@ -67,6 +71,8 @@ Workers should initiate outbound connections, use per-worker identities, reject 
 flowchart TB
     Host[Developer host]
     App[Next.js dev server :3000]
+    Agent[Worker agent]
+    Runner[BullMQ runner]
     DevEmail[(.local/emails)]
 
     subgraph Ingress[Ingress network]
@@ -86,8 +92,13 @@ flowchart TB
     end
 
     Host --> App
+    Host --> Agent
+    Host --> Runner
+    Agent -->|signed loopback HTTP in explicit dev mode| App
     App -->|identity and application data over loopback| Mongo
-    App -->|available locally; app limiter uses memory in development| Redis
+    App -->|BullMQ; limiter uses memory in development| Redis
+    Runner -->|BullMQ| Redis
+    Runner -->|reconciliation state| Mongo
     App -->|file email in development| DevEmail
     Host -->|loopback only| Caddy
     Host -->|loopback only| Nginx
@@ -108,4 +119,4 @@ Named volumes hold MongoDB, Redis, MinIO, Prometheus, and the Mongo replica key.
 
 Application records are created by real account and organization flows. The bootstrap scripts do not create product users, organizations, activity, or other fake business records.
 
-No worker runtime or protocol, provisioning engine, Stripe integration, Vault integration, product backup/restore flow, domain management, or application use of MinIO is present in Phase 1.
+No worker command transport, workload runtime, provisioning engine, Stripe integration, Vault integration, product backup/restore flow, domain management, outbox relay, or application use of MinIO is present in Phase 2. Declared queue names and persisted desired state are contracts for later phases, not claims that those processors exist.
